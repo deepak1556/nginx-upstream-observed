@@ -727,3 +727,80 @@ static ngx_int_t ngx_http_upstream_choose_observed_peer(ngx_peer_connection_t *p
 
   return NGX_OK:
 }
+
+ngx_int_t ngx_http_upstream_get_observed_peer(ngx_peer_connection_t *pc, void *data) {
+  ngx_uint_t                              ret;
+  ngx_uint_t                              peer_id, i;
+  ngx_http_upstream_observed_peer_data_t *fp = data;
+  ngx_http_upstream_observed_peer_t      *peer;
+  ngx_atomic_t                           *peer;
+
+  peer_id = fp->current;
+  fp->current = (fp->current + 1) % fp->peers->number;
+
+  lock = &fp->peers->shared->lock;
+  ngx_spinlock(lock, ngx_pid, 1024);
+  ret = ngx_http_upstream_choose_observed_peer(pc, fp, &peer_id);
+  ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] fp->current = %d, peer_id = %d, ret = %d", fp->current, ret);
+
+  if(pc) {
+    pc->tries--;
+  }
+
+  if(ret == NGX_BUSY) {
+    for(i = 0; i < fp->peers->number; i++) {
+      fp->peers->peer[i].shared->fails = 0;
+    }
+
+    pc->name = fp->peers->name;
+    fp->current = NGX_PEER_INVALID;
+    ngx_spinlock_unlock(lock);
+    return NGX_BUSY;
+  }
+
+  peer = &fp->peers->peer[peer_id];
+  fp->current = peer_id;
+  if(!fp->peers->no_rr) {
+    fp->peers->current = peer_id;
+  }
+  pc->sockaddr = peer->sockaddr;
+  pc->socklen = peer->socklen;
+  pc->name = &peer->name;
+
+  peer->shared->last_req_id = fp->peers->shared->total_requests;
+  ngx_http_upstream_observed_update_nreq(fp, i, pc->log);
+  peer->shared->total_req++;
+  ngx_spinlock_unlock(lock);
+
+  return ret;
+}
+
+void ngx_http_upstream_free_observed_peer(ngx_peer_connection_t *pc, void *data, ngx_uint_t state) {
+  ngx_http_upstream_observed_peer_data_t *fp = data;
+  ngx_http_upstream_observed_peer_t      *peer;
+  ngx_atomic_t                           *lock;
+
+  ngx_log_debug4(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed fp->curent = %d, state = %ui, pc->tries = %d, pc->data = %p", fp->current, state, pc->tries, pc->data);
+
+  if(fp->current == NGX_PEER_INVALID) {
+    return;
+  }
+  lock = &fp->peers->shared->lock;
+  ngx_spinlock(lock, ngx_pid, 1024);
+  if(!ngx_bitvector_test(fp->done, fp->current)) {
+    ngx_bitvector_set(fp->done, fp->current);
+    ngx_http_upstream_observed_update_nreq(fp, -1, pc->log);
+  }
+
+  if(fp->peers->number == 1) { 
+    pc->tries = 0;
+  }
+
+  if(state & NGX_PEER_INVALID) {
+    peer = &fp->peers->peer[fp->current];
+    peer->shared->fails++;
+    peer->accessed = ngx_time();
+  }
+
+  ng_spinlock_unlock(lock);
+}
