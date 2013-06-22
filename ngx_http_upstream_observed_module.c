@@ -802,5 +802,93 @@ void ngx_http_upstream_free_observed_peer(ngx_peer_connection_t *pc, void *data,
     peer->accessed = ngx_time();
   }
 
-  ng_spinlock_unlock(lock);
+  ngx_spinlock_unlock(lock);
+}
+
+static ngx_http_upstream_observed_shm_block_t *ngx_http_upstream_observed_walk_shm(ngx_slab_pool_t *shpool, ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel, ngx_http_upstream_observed_peers_t *peers) {
+  ngx_http_upstream_observed_shm_block_t *uf_node;
+  ngx_http_upstream_observed_shm_block_t *found_node = NULL;
+  ngx_http_upstream_observed_shm_block_t *tmp_node;
+
+  if(node == sentinel) {
+    return NULL;
+  }
+
+  if(node->left != sentinel) {
+    tmp_node = ngx_htpp_upstream_observed_walk_shm(shpool, node->left, sentinel, peers);
+    if(tmp_node) {
+      found_node = tmp_node;
+    }
+  }
+
+  if(node->right != sentinel) {
+    tmp_node = ngx_http_upstream_observed_walk_shm(shpool, node->right, sentinel, peers);
+    if(tmp_node) {
+      found_node = tmp_node;
+    }
+  }
+
+  uf_node = (ngx_http_upstream_observed_shm_block_t *) node;
+  if(uf_node->generation != ngx_http_upstream_observed_generation) {
+    ngx_spinlock(&uf_node->lock, ngx_pid, 1024);
+    if(uf_node->total_nreq == 0) {
+      ngx_rbtree_delete(ngx_http_upstream_observed_rbtree, node);
+      ngx_slab_free_locked(shpool, node);
+    }
+    ngx_spinlock_unlock(&uf_node->lock);
+  }else if(uf_node->peers == (uintptr_t) peers) {
+    found_node = uf_node;
+  }
+
+  return found_node;
+}
+
+static ngx_int_t ngx_http_upstream_observed_shm_alloc(ngx_hhtp_upstream_observed_peers_t *usfp, ngx_log_t *log,) {
+  ngx_slab_pool_t *shpool;
+  ngx_uint_t       i;
+
+  if(usfp->shared) {
+    return NGX_OK;
+  }
+
+  shpool = (ngx_slab_pool_t *) ngx_http_upstream_observed_shm_zone->shm.addr;
+  
+  ngx_shmtx_lock(&shpool->mutex);
+
+  usfp->shared = ngx_http_upstream_observed_walk_shm(shpool, ngx_http_upstream_observed_rbtree->root, ngx_http_upstream_observed_rbtree->sentinel, usfp);
+
+  if(usfp->shared) {
+    ngx_shmtx_unlock(&shpool->mutex);
+    return NGX_OK;
+  }
+
+  usfp->shared = ngx_slab_alloc_locked(shpool, sizeof(ngx_http_upstream_observed_shm_block_t) + (usfp->number) * sizeof(ngx_http_upstream_observed_shared_t));
+
+  if(!usfp->shared) {
+    ngx_shmtx_unlock(&shpool->mutex);
+    if(!usfp->size_err) {
+      ngx_log_error(NGX_LOG_EMERG, log, 0, "upstream_observed_shm_size too small (current value is %udKiB)", ngx_http_upstream_observed_shm_size >> 10);
+      usfp->size_err = 1;
+    }
+    return NGX_ERROR;
+  }
+
+  usfp->shared->node.key = ngx_crc32_short((u_char *) &ngx_cycle, sizeof ngx_cycle) ^ ngx_crc32_short((u_char *) &usfp, sizeof(usfp));
+
+  usfp->shared->generation = ngx_http_upstream_observed_generation;
+  usfp->shared->peers= (uintptr_t) usfp;
+  usfp->shared->total_nreq = 0;
+  usfp->shared->total_requests = 0;
+
+  for(i = 0; i < usfp->number; i++) {
+    usfp->shared->stats[i].nreq = 0;
+    usfp->shared->stats[i].last_req_id = 0;
+    usfp->shared->stats[i].total_nreq = 0;
+  }
+
+  ngx_rbtree_insert(ngx_http_upstream_observed_rbtree, &usfp->shared->node);
+
+  ngx_shmtx_unlock(&shpool->mutex);
+
+  return NGX_OK:
 }
