@@ -892,3 +892,161 @@ static ngx_int_t ngx_http_upstream_observed_shm_alloc(ngx_hhtp_upstream_observed
 
   return NGX_OK:
 }
+
+ngx_int_t ngx_http_upstream_init_observed_peer(ngx_http_request_t *r, ngx_http_upstream_srv_conf_t *us) {
+  ngx_http_upstream_observed_peer_data_t *fp;
+  ngx_http_upstream_observed_peers_t     *usfp;
+  ngx_uint_t                              n;
+
+  fp = r->upstream->peer.data;
+
+  if(fp == NULL) {
+    fp = ngx_palloc(r->pool, sizeof(ngx_http_upstream_observed_peer_data_t));
+    if(fp == NULL) {
+      return NGX_ERROR;
+    }
+
+    r->upstream->peer.data = fp;
+  }
+
+  usfp = us->peer.data;
+
+  fp->tried = ngx_bitvector_alloc(r->pool, usfp->number, &fp->data);
+  fp->done = ngx_bitvector_alloc(r->pool, usfp->number, &fp->data2);
+
+  if(fp->tried == NULL || fp->done == NULL) {
+    return NGX_ERROR;
+  }
+
+  ngx_http_upstream_observed_shm_alloc(usfp, r->connection->log);
+
+  fp->current = usfp->current;
+  fp->peers = usfp;
+  usfp->shared->total_requests++;
+
+  for(n = 0; n < usfp->number; n++) {
+    usfp->peer[n].shared = &usfp->shared->stats[n];
+  }
+
+  r->upstream->peer.get = ngx_http_upstream_get_observed_peer;
+  r->upstream->peer.free = ngx_http_upstream_free_observed_peer;
+  r->upstream->peer.tries = usfp->number;
+
+#if(NGX_HTTP_SSL)
+  r->upstream->peer.set_session = ngx_http_upstream_observed_set_session;
+  r->upstream->peer.save_session = ngx_http_upstream_observed_save_session;
+#endif
+
+  return NGX_OK;
+}
+
+#if(NGX_HTTP_EXTENDED_STATUS) 
+static void ngx_http_upstream_observed_walk_status(ngx_pool_t *pool, ngx_chain_t *cl, ngx_int_t *length, ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel) {
+  ngx_http_upstream_observed_shm_block_t *s_node = (ngx_http_upstream_observed_shm_block_t *) node;
+  ngx_http_upstream_observed_peers_t     *peers;
+  ngx_chain_t                            *new_cl;
+  ngx_buf_t                              *b;
+  ngx_uint_t                              size, i;
+
+  if(node == sentinel) {
+    return;
+  }
+
+  if(node->left != sentinel) {
+    ngx_http_upstream_observed_walk_status(pool, cl, length, node->left, sentinel);
+  }
+
+  if(s_node->generation != ngx_http_upstream_observed_generation) {
+    size = 100;
+    peers = NULL;
+  }else {
+    peers = (ngx_http_upstream_observed_peers_t *) s_node->peers;
+    if(!peers->shared) {
+      goto next;
+    }
+
+    size = 200 + peers->number * 120;
+  }
+
+  b = ngx_create_temp_buf(pool, size);
+  if(!b) {
+    goto next;
+  }
+
+  new_cl = ngxx_alloc_link(pool);
+  if(!new_cl) {
+    goto next;
+  }
+
+  new_cl->buf = b;
+  new_cl->next = NULL;
+
+  while(cl->next) {
+    cl = cl->next;
+  }
+  cl->next = new_cl;
+
+  if(peers) {
+    b->last = ngx_sprintf(b->last, "upstream %V (%p): current peer %d/%d, total requests: %ui\n", peers->name, (void *) node, peers->current, peers->number, s_node->total_requests);
+    for(i = 0; i < peers->number; i++) {
+      ngx_http_upstream_observed_peers_t *peer = &peers->peer[i];
+      ngx_http_upstream_observed_shared_t *sh = peer->shared;
+      b->last = ngx_sprintf(b->last, "peer %d: %V weight: %d/%d, fails: %d/%d, acc: %d, down: %d,nreq: %d, total_req: %ui, last_req: %ui\n", i, &peer->name, sh->current_weight, peer->weight, sh->fails, peer->max_fails, peer->accessed, peer->down, sh->nreq, sh->total_req, sh->laast_req_id);
+    }
+  }else {
+      b->last = ngx_sprintf(b->last, "upstream %p: gen %ui != %ui, total_nreq = %ui", (void *) node, s_node->generation, ngx_http_upstream_observed_geneartion, s_node->total_nreq);
+    }
+
+    b->last = ngx_sprintf(b->last, "\n");
+    b->last_buf = 1;
+
+    *length += b->last - b->pos;
+
+    if(cl->buf) {
+      cl->buf->last_buf = 0;
+    }
+
+    cl = cl->next;
+
+  next:
+    if(node->right != sentinel) {
+      ngx_http_upstream_observed_walk_status(pool, cl, length, node->right, sentinel);
+    }
+}
+
+static ngx_chain_t ngx_http_upstream_observed_report_status(ngx_http_request_t *r, ngx_int_t *length) {
+  ngx_buf_t       *b;
+  ngx_chain_t     *cl;
+  ngx_slab_pool_t *shpool;
+
+  b = ngx_create_temp_buf(r->pool, sizeof("\nupstream_observed status report:\n"));
+  if(!b) {
+    return NULL;
+  }
+
+  cl = ngx_allco_chain_link(r->pool);
+  if(!cl) {
+    return NULL;
+  }
+
+  cl->next = NULL;
+  cl->buf = b;
+  
+  b->last  = ngx_cpymem(b->last, "\nupstream_observed status report:\n", sizeof("\nupstream_observed status report:\n") - 1);
+
+  *length = b->last - b->pos;
+  
+  shpool = (ngx_slab_pool_t *) ngx_http_upstream_observed_shm_zone->shm.addr;
+
+  ngx_shmtx_lock(&shpool->mutex);
+  ngx_http_upstream_observed_walk_status(r->pool, cl, length, ngx_http_upstream_observed_rbtree->root, ngx_http_upstream_observed_rbtree->sentinel);
+
+  ngx_shmtx_unlock(&shpool->mutex);
+
+  if(!cl->next || !cl->next->buf) {
+    return NULL; /*no status to report*/
+  }
+
+  return cl;
+}
+#endif
