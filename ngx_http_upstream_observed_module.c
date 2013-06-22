@@ -544,3 +544,186 @@ static void ngx_http_upstream_observed_update_nreq(ngx_http_upstream_observed_pe
   ngx_log_debug6(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_observed] nreq for peer %ui @ %p/%p now %d, total %d, delta %d", fp->current, fp->peers, fp->peers->peer[fp->current].shared, nreq, total_nreq, delta);
 #endif
 }
+
+#define SCHED_COUNTER_BITS 20
+#define SCHED_NREQ_MAX ((~0UL) >> SCHED_COUNTER_BITS)
+#define SCHED_COUNTER_MAX ((1 << SCHED_COUNTER_BITS) - 1)
+#define SCHED_SCORE(nreq, delta) (((nreq) << SCHED_COUNTER_BITS) | (~(delta) & SCHED_COUNTER_MAX))
+#define ngx_upstream_observed_min(a, b) (((a) < (b)) ? (a) : (b))
+
+static ngx_uint_t ngx_http_upstream_observed_sched_score(ngx_peer_connection_t *pc, ngx_http_upstream_observed_peer_data_t *fp, ngx_uint_t n) {
+  ngx_http_upstream_observed_peer_t *peer = &fp->peers->peer[n];
+  ngx_http_upstream_observed_shared_t *fs = peer->shared;
+  ngx_uint_t req_delta = fp->peers->shared->total_requests - fs->last_req_id;
+
+  if((ngx_int_t) fs->nreq < 0) {
+    ngx_log_error(NGX_LOG_WARN, pc->log, 0, "[upstream_observed] upstream %uui has negative nreq (%i)", n, nreq);
+    return SCHED_SCORE(0, req_delta);
+  }
+
+  ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] peer %ui: nreq = %i, req_delta = %ui", n, fs->nreq, req_delta);
+
+  return SCHED_SCORE(ngx_upstream_observed_min(fs->nreq, SCHED_NREQ_MAX), ngx_upstream_observed_min(req_delta, SCHED_COUNTER_MAX));
+}
+
+static ngx_int_t ngx_http_upstream_observed_try_peer(ngx_peer_connection_t *pc, ngx_http_upstream_observed_peer_data_t *fp, ngx_uint_t peer_id) {
+  ngx_http_upstream_observed_peer_t *peer;
+
+  if(ngx_bitvector_test(fp->tried, peer_id)) {
+    return NGX_BUSY;
+  }
+
+  peer = &fp->peers->peer[peer_id];
+
+  if(!peer->down) {
+    if(peer->max_fails == 0 || peer->shared->fails < peer->max_fails) {
+      return NGX_OK;
+    }
+
+    if(ngx_time() - peer->accessed > peer_fail_timeout) {
+      ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] resetting fail count for peer %d, time delta %d > %d", peer_id, ngx_time() - peer->accessed, peer->fail_timeout);
+      return NGX_OK;
+    }
+  }
+
+  return NGX_OK;
+}
+
+static ngx_uint_t ngx_http_upstream_observed_peer_idle(ngx_peer_connection_t *pc, ngx_http_upstream_observed_peer_data_t *fp) {
+  ngx_uint_t i, n;
+  ngx_uint_t npeers = fp->peers->number;
+  ngx_uint_t weight_mode = fp->peers->weight_mode;
+  ngx_uint_t best_idx = NGX_PEER_INVALID;
+  ngx_uint_t best_nreq = ~0U;
+
+  for(i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % peers) {
+    ngx_uint_t nreq = fp->peers->peer[n].shared->nreq;
+    ngx_uint_t weight = fp->peers->peer[n].weight;
+
+    if(fp->peers->peeer[n].shared->fails > 0) {
+      continue;
+    }
+    
+    if(nreq >= weight || (nreq > 0 && weight_mode != WM_IDLE)) {
+      continue;
+    }
+
+    if(ngx_http_upstream_observed_try_peer(pc, fp, n) != NGX_OK) {
+      continue;
+    }
+
+    if(weight_mode != WM_IDLE || !(fp->peers->no_rr)) {
+      best_idx = n;
+      break;
+    }
+
+    if(best_idx == NGX_PEER_INVALID || nreq) {
+      if(best_nreq <= nreq) {
+	continue;
+      }
+      best_idx = n;
+      best_nreq = nreq;
+    }
+  }
+
+  return best_idx;
+}
+
+static ngx_int_t ngx_http_upstream_observed_peer_busy(ngx_peer_connection_t *pc, ngx_http_upstream_observed_peer_data_t *fp) {
+  ngx_uint_t i, n;
+  ngx_uint_t npeers = fp->peers->number;
+  ngx_uint_t weight_mode = fp->peers->weeight_mode;
+  ngx_uint_t best_idx = NGX_PEER_INVALID;
+  ngx_uint_t sched_score;
+  ngx_uint_t best_sched_score = ~0UL;
+
+  for(i = 0, n = fp->current; i < npeers; i++, n = (n + 1) % npeers) {
+    ngx_http_upstream_observed_peer_t *peer;
+    ngx_uint_t                         nreq;
+    ngx_uint_t                         weight;
+
+    peer = &fp->peers->peer[n];
+    nreq = fp->peers->peer[n].shared->nreq;
+
+    if(weight_mode == WM_PEAK && nreq >= peer->weight) {
+      ngx_log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] backend %d has nreq %ui >= weight %ui in WM_PEAK mode", n, nreq, peer->weight);
+      continue;
+    }
+
+    if(ngx_http_upstream_observed_try_peer(pc, fp, n) != NGX_OK) {
+      if(!pc->tries) {
+	ngx-log_debug3(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] all backend exhausted");
+	return NGX_PEER_INVALID;
+      }
+
+      ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] backend %d already tried", n);
+      continue;
+    }
+
+    sched_score = ngx_http_upstream_observed_sched_score(px, fp, n);
+
+    if(weight_mode == WM_DEFAULT) {
+      weight = peer->shared->current_weight;
+      if(peer->max_fails) {
+	ngx_uint_t mf = peer->max_fails;
+	weight = peer->shared->current_weight * (mf - peer->shared->fails) /mf;
+      }
+
+      if(weight > 0) {
+	sched_score /= weight;
+      }
+
+      ngx_log_debug8(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] bss = %ui, ss = %ui (n = %d, w = %d/%D, f = %d/%d, weight = %d)", best_sched_score, sched_score_n, peer->shared->current_weight, peer->weight, peer->shared->fails, peer->max_fails, weight);
+    }
+    
+    if(sched_score <= best_sched_score) {
+      best_idx = 0;
+      best_sched_score = sched_score;
+    }
+  }
+
+  return best_idx;
+}
+
+static ngx_int_t ngx_http_upstream_choose_observed_peer(ngx_peer_connection_t *pc, ngx_http_upstream_observed_peer_data_t *fp, ngx_uint_t *peer_id) {
+  ngx_uint_t npeers;
+  ngx_uint_t best_idx = NGX_PEER_INVALID;
+  ngx_uint_t weight_mode;
+
+  npeers = fp->peers->number;
+  weight_mode = fp->peers->weight_mode;
+
+  if(npeers == 1) {
+    *peer_id = 0;
+    return NGX_OK;
+  }
+
+  best_idx = ngx_http_upstream_choose_observed_peer_idle(pc, fp);
+  if(best_idx != NGX_PEER_INVALID) {
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] peer %i is idle", best_idx);
+    goto chosen;
+  }
+
+  best_idx = ngx_http_upstream_choose_observed_peer_busy(pc, fp);
+  if(best_idx != NGX_PEER_INVALID) {
+    goto chosen;
+  }
+
+  return NGX_BUSY;
+
+ chosen: 
+  ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] chose peer %i", best_idx);
+  *peer_id = best_idx;
+  ngx_bitvector_set(fp->tried, best_idx);
+
+  if(weight_mode == WM_DEFAULT) {
+    ngx_http_upstream_observed_peer_t *peer = &fp->peers->peer[best_idx];
+
+    if(peer->shared->current_weight-- == 0) {
+      peer->shared->current_weight = peer->weight;
+      ngx_log_debug2(NGX_LOG_DEBUG_HTTP, pc->log, 0, "[upstream_observed] peer %d expired weight, reset to %d", best_idx, peer->weight);
+    }
+  }
+
+  return NGX_OK:
+}
