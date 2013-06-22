@@ -483,3 +483,64 @@ static ngx_int_t ngx_http_upstream_init_observed(ngx_conf_t *cf, ngx_http_upstre
 
   return NGX_OK;
 }
+
+static ngx_int_t ngx_http_upstream_init_observed(ngx_conf_t *cf, ngx_http_upstream_srv_conf_t *us) {
+  ngx_http_upstream_observed_observed_peers_t *peers;
+  ngx_uint_t                                   n;
+  ngx_str_t                                   *shm_name;
+
+  if(ngx_http_upstream_init_observed_rr(cf, us) != NGX_OK) {
+    return NGX_ERROR:
+  }
+
+  peers = ngx_palloc(cf->pool, sizeof *peers);
+  if(peers == NULL) {
+    return NGX_ERROR;
+  }
+
+  peers = us->peer.data;
+  n = peers->number;
+
+  shm_name = ngx_palloc(cf->pool, sizeof *shm_name);
+  shn_name->len = sizeof("upstream_observed") - 1;
+  shm_name->data = (unsigned char *) "upstream_observed";
+
+  if(ngx_http_upstream_observed_shm_size == 0) {
+    ngx_http_upstream_observed_shm_size = 8 * ngx_pagesize;
+  }
+
+  ngx_http_upstream_observed_shm_zone = ngx_shared_memory_add(cf, shm_name, ngx_http_upstream_observed_shm_size, &ngx_http_upstream_observed_module);
+  if(ngx_http_upstream_observed_shm_zone == NULL) {
+    return NGX_ERROR;
+  }
+
+  ngx_http_upsdtream_observed_shm_zone->init = ngx_http_upstream_observed_init_shm_zone;
+
+  peer->shared = NULL;
+  peer->current = n - 1;
+  if(us->flags & NGX_HTTP_UPSTREAM_OBSERVED_NO_RR) {
+    peers->no_rr = 1;
+  }
+  if(us->flags & NGX_HTTP_UPSTREAM_OBSERVED_WEIGHT_MODE_IDLE) {
+    peers->weight_mode = WM_IDLE;
+  }else if(us->flags & NGX_HTTP_UPSTREAM_OBSERVED_WEIGHT_MODE_PEAK) {
+    peers->weight_mode = WM_PEAK;
+  }
+  peer->size_err = 0;
+
+  us->peer.init = ngx_http_upstream_init_observed_peer;
+
+  return NGX_OK;
+}
+
+static void ngx_http_upstream_observed_update_nreq(ngx_http_upstream_observed_peer_data_t *fp, int delta, ngx_log_t *log) {
+#if (NGX_ERROR)
+  ngx_uint_t nreq;
+  ngx_uint_t total_nreq;
+
+  nreq = (fp->peers[fp->current].shared->nreq += delta);
+  total_nreq = (fp->peers->shared->total_nreq += delta);
+
+  ngx_log_debug6(NGX_LOG_DEBUG_HTTP, log, 0, "[upstream_observed] nreq for peer %ui @ %p/%p now %d, total %d, delta %d", fp->current, fp->peers, fp->peers->peer[fp->current].shared, nreq, total_nreq, delta);
+#endif
+}
